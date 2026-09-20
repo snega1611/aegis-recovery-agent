@@ -260,7 +260,7 @@ def normalize_tool_call(response, tools_by_name):
 
 async def main():
 
-    incident_id = "ce70afdc-69c3-4c39-95ef-3ed71c31ce2b"
+    incident_id = "INC-1001"
 
     response = httpx.get(f"http://localhost:8000/incidents/{incident_id}")
     response.raise_for_status()

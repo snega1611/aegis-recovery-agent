@@ -5,7 +5,7 @@ from pathlib import Path
 from langchain.mcp import MCPAdapter
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-SERVERS_DIR = PROJECT_ROOT / "servers"
+SERVERS_DIR = PROJECT_ROOT / "mcp"
 
 PASS_THROUGH = ("PROMETHEUS_URL", "DOCKER_HOST")
 

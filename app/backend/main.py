@@ -4,6 +4,7 @@ import threading
 import psutil
 import logging
 import uuid
+import this_module_does_not_exist
 
 import psycopg2
 from fastapi import FastAPI, Request, HTTPException
@@ -106,7 +107,7 @@ def get_db_connection():
     return psycopg2.connect(
         host=os.getenv("DB_HOST", "127.0.0.1"),
         port=os.getenv("DB_PORT", "5433"),
-        database=os.getenv("DB_NAME", "aegi"),
+        database=os.getenv("DB_NAME", "aegis"),
         user=os.getenv("DB_USER", "postgres"),
         password=os.getenv("DB_PASSWORD", "postgres"),
         connect_timeout=5,
