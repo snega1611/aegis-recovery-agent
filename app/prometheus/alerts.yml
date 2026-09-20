@@ -1,0 +1,13 @@
+groups:
+  - name: aegis-incidents
+    rules:
+
+      - alert: HighCPUUsage
+        expr: aegis_cpu_usage_percent > 70
+        for: 30s
+        labels:
+          severity: warning
+          incident_type: high_cpu
+        annotations:
+          summary: "High CPU usage detected"
+          description: "Aegis backend CPU usage has remained above 70% for 30 seconds."

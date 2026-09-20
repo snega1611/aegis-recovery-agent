@@ -1,0 +1,10 @@
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: aegis-backend
+
+receivers:
+  - name: aegis-backend
+    webhook_configs:
+      - url: "http://backend:8000/alerts"

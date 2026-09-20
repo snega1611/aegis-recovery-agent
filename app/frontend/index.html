@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Aegis</title>
+</head>
+
+<body>
+    <h1>Aegis</h1>
+    <p>AI SRE Incident Response Platform</p>
+
+    <h2>Backend Status</h2>
+    <p id="status">Checking...</p>
+
+    <h2>Orders</h2>
+    <ul id="orders"></ul>
+
+    <script>
+        const API_URL = "http://127.0.0.1:8000";
+
+        async function checkHealth() {
+            try {
+                const response = await fetch(`${API_URL}/health`);
+                const data = await response.json();
+
+                document.getElementById("status").textContent =
+                    data.status;
+            } catch (error) {
+                document.getElementById("status").textContent =
+                    "Backend unavailable";
+            }
+        }
+
+        async function loadOrders() {
+            try {
+                const response = await fetch(`${API_URL}/orders`);
+                const data = await response.json();
+
+                const ordersList = document.getElementById("orders");
+
+                data.orders.forEach(order => {
+                    const item = document.createElement("li");
+                    item.textContent =
+                        `Order ${order.id}: ${order.status}`;
+                    ordersList.appendChild(item);
+                });
+            } catch (error) {
+                console.error("Failed to load orders:", error);
+            }
+        }
+
+        checkHealth();
+        loadOrders();
+    </script>
+</body>
+</html>
