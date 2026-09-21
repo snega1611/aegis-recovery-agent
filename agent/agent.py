@@ -276,7 +276,7 @@ def normalize_tool_call(response, tools_by_name):
 
 async def main():
 
-    incident_id = "INC-1002"
+    incident_id = "INC-1003"
 
     conn = psycopg2.connect(
         host="localhost",
@@ -389,6 +389,7 @@ async def main():
                 tried=format_tried(state["used_tools"]),
                 evidence=format_evidence(state["evidence"]),
                 open_question=open_question,
+                suggested_tool=suggested_tool,
             )
         )
 
