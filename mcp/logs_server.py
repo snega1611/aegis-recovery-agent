@@ -82,7 +82,9 @@ def duration_seconds(line: str):
     )
 )
 def search_logs(query: str) -> dict:
-    """Search application logs for a specific literal term."""
+    """Search application logs for a specific literal term.
+    Not for the word ERROR (the error search covers it). Reads only the application's own log file.
+    """
 
     query = query.strip()
 
@@ -112,7 +114,10 @@ def search_logs(query: str) -> dict:
     )
 )
 def search_errors() -> dict:
-    """Return recent application error log entries."""
+    """Return recent application error log entries.
+    Reads only the application's own log file, so a crash before the app starts logging will not appear here (container logs will show it). 
+    This is the standard error search: do not also search the general logs for the word ERROR.
+    """
 
     return build_result(
         "application_error_logs",
@@ -129,7 +134,8 @@ def search_errors() -> dict:
     )
 )
 def search_slow_requests() -> dict:
-    """Return recent log entries for slow requests."""
+    """Return recent log entries for slow requests.
+    Use only when the incident concerns latency, timeouts or slow requests. Not useful for outages or crashes."""
 
     def is_slow(line: str) -> bool:
         seconds = duration_seconds(line)

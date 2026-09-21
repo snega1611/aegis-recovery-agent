@@ -194,7 +194,9 @@ def query_memory() -> dict:
     )
 )
 def query_memory_history() -> dict:
-    """NEW: memory trend. CPU had a history tool; memory had none."""
+    """NEW: memory trend. CPU had a history tool; memory had none.
+    Use it when memory growth or an out-of-memory kill is suspected.
+    """
 
     return instant_metric(
         evidence_type="memory_history",
@@ -214,7 +216,9 @@ def query_memory_history() -> dict:
     )
 )
 def query_service_up() -> dict:
-    """NEW: distinguishes 'service down' from 'no data'."""
+    """NEW: distinguishes 'service down' from 'no data'.
+    Use this early when an incident says a service is down or unreachable: it shows whether Prometheus can reach it right now. It does not say why.
+    """
 
     return instant_metric(
         evidence_type="service_up_current",

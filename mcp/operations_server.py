@@ -90,10 +90,14 @@ def percent(text):
         "Use this to identify the runtime container associated with an incident "
         "and to get valid container names for other tools. "
         "This is read-only container evidence."
+        
     )
 )
 def list_containers() -> dict:
-    """Return the Aegis lab container inventory (not every container on the host)."""
+    """Return the Aegis lab container inventory (not every container on the host).
+    Use this first when an incident says a container or service is down: it shows which containers exist and whether they 
+            are running, and gives the exact names other container tools need.
+            """
 
     code, stdout, stderr = run_command(
         [
@@ -127,6 +131,7 @@ def list_containers() -> dict:
 
 @mcp.tool(
     description=(
+        
         "Inspect one Aegis lab Docker container and return its runtime state: "
         "status, restart count, exit code, OOM-killed flag, health, and "
         "configured CPU/memory limits. "
@@ -135,7 +140,10 @@ def list_containers() -> dict:
     )
 )
 def inspect_container(container_name: str) -> dict:
-    """Inspect the runtime state of one Docker container."""
+    """Inspect the runtime state of one Docker container.
+        Use this first for a container that is stopped, exited, restarting or crashing. 
+        It works on stopped containers and shows how the container ended (exit code, OOM kill, error).
+            """
 
     problem = check_container(container_name)
     if problem:
@@ -172,6 +180,8 @@ def inspect_container(container_name: str) -> dict:
         container=container_name,
         container_status=state.get("Status"),      # not "status": that key is the envelope
         running=state.get("Running"),
+        error=state.get("Error") or None,
+        image=(info.get("Config") or {}).get("Image"), 
         restarting=state.get("Restarting"),
         # RestartCount is a TOP-LEVEL field of `docker inspect`, not part of
         # State. The old code read it from State and always returned null.
@@ -197,7 +207,10 @@ def inspect_container(container_name: str) -> dict:
     )
 )
 def get_container_stats(container_name: str) -> dict:
-    """Return current Docker container resource statistics."""
+    
+    """Return current Docker container resource statistics.
+    Only meaningful for a RUNNING container. If it reports running=false, use the container inspect tool instead.
+    """
 
     problem = check_container(container_name)
     if problem:
@@ -272,7 +285,10 @@ def get_container_stats(container_name: str) -> dict:
     )
 )
 def get_container_logs(container_name: str) -> dict:
-    """Return recent logs from one Docker container."""
+    """Return recent logs from one Docker container.
+    Works on stopped containers. Use it when the container state shows a non-zero exit code, 
+    an error or restarts: the last lines usually show why the process ended.
+    """
 
     problem = check_container(container_name)
     if problem:
@@ -320,7 +336,9 @@ def get_container_logs(container_name: str) -> dict:
     )
 )
 def get_recent_commits(limit: int = 5) -> dict:
-    """Return recent Git commits."""
+    """Use it only when evidence points to a code, configuration, image or deployment change, 
+    for example a failure right after startup with an application or import error.
+    Return recent Git commits."""
 
     limit = max(1, min(limit, 20))
 
@@ -361,7 +379,9 @@ def get_recent_commits(limit: int = 5) -> dict:
     )
 )
 def get_commit(commit: str) -> dict:
-    """Return metadata for a specific Git commit."""
+    """Return metadata for a specific Git commit.
+    Use only after the recent-commits tool shows a commit relevant to the evidence.
+    """
 
     if not COMMIT_RE.match(commit):
         return err(
@@ -406,7 +426,9 @@ def get_commit(commit: str) -> dict:
     )
 )
 def get_commit_files(commit: str) -> dict:
-    """Renamed from get_file_diff: it only ever returned `git show --stat`."""
+    """Renamed from get_file_diff: it only ever returned `git show --stat`.
+    Use only after the recent-commits tool shows a commit relevant to the evidence.
+    """
 
     if not COMMIT_RE.match(commit):
         return err(

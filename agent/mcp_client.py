@@ -32,7 +32,7 @@ def create_mcp_adapter() -> MCPAdapter:
     """Investigation servers only (read-only). Never add remediation here."""
     return MCPAdapter(
         {
-            "prometheus": stdio_server("prometheus.py"),
+            "prometheus": stdio_server("prometheus_server.py"),
             "logs": stdio_server("logs_server.py"),
             "operations": stdio_server("operations_server.py"),
         }

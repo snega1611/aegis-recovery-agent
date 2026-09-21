@@ -12,7 +12,9 @@ def create_knowledge_tool(vector_store):
 
     @tool
     def search_incident_knowledge(query: str) -> str:
-        """Search Aegis operational knowledge for incident investigation guidance."""
+        """Search Aegis operational knowledge for incident investigation guidance.
+        Returns general operational guidance. It is not evidence about this incident: use it to decide what to check or how to read evidence, never as proof of a cause.
+        """
 
         results = retrieve_knowledge(
             vector_store,
