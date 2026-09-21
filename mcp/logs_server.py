@@ -23,11 +23,7 @@ DURATION_RE = re.compile(r"duration=([0-9]*\.?[0-9]+)(ms|s)\b")
 
 def scan(predicate):
     """Stream the log once. Returns (total_matches, newest_matching_lines)
-    or None if the log file does not exist.
-
-    The total is the TRUE number of matching lines. Previously match_count was
-    capped at 20, so 5000 errors were reported as "20".
-    """
+    or None if the log file does not exist."""
 
     total = 0
     recent = deque(maxlen=MAX_LOG_LINES)
@@ -72,20 +68,18 @@ def duration_seconds(line: str):
     return value / 1000 if match.group(2) == "ms" else value
 
 
+# NOTE: with FastMCP, `description=` REPLACES the docstring. Guidance for the
+# model must be in `description=`; text added to a docstring is never seen.
+
 @mcp.tool(
     description=(
-        "Search Aegis application logs using a short literal text query. "
-        "Use specific terms from the incident, such as an endpoint path, "
-        "an error message, or a status code. "
-        "Do not send a sentence, hypothesis, or explanation. "
-        "Returns the total number of matching entries and the newest ones."
+        "Search the application's own log file for a short literal term (an "
+        "endpoint, error text or status code). Do not search for the word "
+        "ERROR: use the error search. Only shows what the application wrote "
+        "to its log file."
     )
 )
 def search_logs(query: str) -> dict:
-    """Search application logs for a specific literal term.
-    Not for the word ERROR (the error search covers it). Reads only the application's own log file.
-    """
-
     query = query.strip()
 
     if not query:
@@ -108,17 +102,13 @@ def search_logs(query: str) -> dict:
 
 @mcp.tool(
     description=(
-        "Search Aegis logs specifically for application errors. "
-        "Use this when investigating HTTP failures or application failures. "
-        "This is read-only evidence."
+        "Find ERROR/CRITICAL lines in the application's own log file. Only "
+        "shows what the application logged: a crash before logging starts is "
+        "not visible here, so read the container's logs instead. Do not also "
+        "search the general log for ERROR."
     )
 )
 def search_errors() -> dict:
-    """Return recent application error log entries.
-    Reads only the application's own log file, so a crash before the app starts logging will not appear here (container logs will show it). 
-    This is the standard error search: do not also search the general logs for the word ERROR.
-    """
-
     return build_result(
         "application_error_logs",
         scan(lambda line: ERROR_RE.search(line) is not None),
@@ -128,15 +118,12 @@ def search_errors() -> dict:
 
 @mcp.tool(
     description=(
-        "Search Aegis logs for slow HTTP requests (5 seconds or longer). "
-        "Use this when investigating latency or unusually long request durations. "
-        "This is read-only evidence."
+        "Find requests that took 5 seconds or more in the application log. "
+        "Use only for latency, timeout or slow-request incidents, not for "
+        "outages or crashes."
     )
 )
 def search_slow_requests() -> dict:
-    """Return recent log entries for slow requests.
-    Use only when the incident concerns latency, timeouts or slow requests. Not useful for outages or crashes."""
-
     def is_slow(line: str) -> bool:
         seconds = duration_seconds(line)
         return seconds is not None and seconds >= SLOW_SECONDS

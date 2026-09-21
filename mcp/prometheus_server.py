@@ -1,11 +1,10 @@
 import math
 import os
-from datetime import datetime, timezone
 
 import httpx
 from fastmcp import FastMCP
 
-from common import err, ok
+from common import err, ok, sanitize_line
 
 
 mcp = FastMCP("Prometheus")
@@ -14,35 +13,26 @@ mcp = FastMCP("Prometheus")
 # PROMETHEUS_URL=http://prometheus:9090
 PROMETHEUS_URL = os.getenv("PROMETHEUS_URL", "http://localhost:9090")
 
-# Scrape job of the Aegis backend (the "job" in prometheus.yml). Needed because
-# generic metrics such as process_resident_memory_bytes exist for EVERY scraped
-# process (Prometheus itself, exporters...). Without a filter you get an
-# arbitrary process.
-BACKEND_JOB = os.getenv("AEGIS_BACKEND_JOB", "aegis-backend")
-JOB = f'{{job="{BACKEND_JOB}"}}'
+MAX_SERIES = 10
+MAX_TARGETS = 20
+
+# The tools below have NO job / service names in them. Anything that depends
+# on which service failed (targets, memory) returns one row per job and
+# instance, and the agent reads the row that matches the incident.
 
 
-def run_query(query: str):
-    """Execute a Prometheus instant query.
-
-    Returns (data, error_message). Exactly one of them is None, so a failed
-    query is never confused with "no data".
-
-    Aegis does not expose arbitrary PromQL as a tool; each tool below uses a
-    fixed, predefined query.
-    """
+def get_json(path: str, params: dict | None = None):
+    """GET a Prometheus API path. Returns (data, error_message).
+    Exactly one of them is None, so a failed request is never confused
+    with "no data"."""
 
     try:
-        response = httpx.get(
-            f"{PROMETHEUS_URL}/api/v1/query",
-            params={"query": query},
-            timeout=5.0,
-        )
+        response = httpx.get(f"{PROMETHEUS_URL}{path}", params=params, timeout=5.0)
         response.raise_for_status()
         payload = response.json()
 
     except Exception as exc:
-        return None, f"Prometheus query failed: {exc}"
+        return None, f"Prometheus request failed: {exc}"
 
     if payload.get("status") != "success":
         return None, payload.get("error", "Prometheus returned an error.")
@@ -50,57 +40,30 @@ def run_query(query: str):
     return payload.get("data", {}), None
 
 
-def first_sample(data: dict):
-    """Return (value, sample_time_iso, series_count) or None."""
-
-    result = data.get("result", [])
-
-    if not result:
-        return None
-
-    sample = result[0].get("value")
-
-    if not sample or len(sample) < 2:
-        return None
-
-    try:
-        value = float(sample[1])
-        sample_time = datetime.fromtimestamp(
-            float(sample[0]), tz=timezone.utc
-        ).isoformat()
-
-    except (TypeError, ValueError):
-        return None
-
-    return value, sample_time, len(result)
+def run_query(query: str):
+    """Execute a fixed Prometheus instant query. Aegis never exposes
+    arbitrary PromQL as a tool."""
+    return get_json("/api/v1/query", {"query": query})
 
 
-def instant_metric(
-    *,
-    evidence_type: str,
-    metric: str,
-    unit: str,
-    time_scope: str,
-    query: str,
-    **extra,
-) -> dict:
-    """Run one fixed query and wrap the result in the standard evidence shape."""
+def instant_metric(*, evidence_type, metric, unit, time_scope, query, **extra) -> dict:
+    """One fixed query, first series only (the queries aggregate with sum())."""
 
     data, error = run_query(query)
 
     if error:
         return err(evidence_type, error)
 
-    sample = first_sample(data)
+    result = data.get("result", [])
 
-    if sample is None:
+    try:
+        value = float(result[0]["value"][1])
+    except (IndexError, KeyError, TypeError, ValueError):
         return err(
             evidence_type,
             "Prometheus returned no data for this measurement "
             "(metric missing or target not scraped).",
         )
-
-    value, sample_time, series_count = sample
 
     if not math.isfinite(value):
         # e.g. latency = sum/count while there is no traffic -> NaN
@@ -116,46 +79,137 @@ def instant_metric(
         value=value,
         unit=unit,
         time_scope=time_scope,
-        sample_time=sample_time,     # when Prometheus evaluated the sample
-        series_count=series_count,   # >1 means the query needs aggregation
+        series_count=len(result),
         **extra,
+    )
+
+
+def series_metric(*, evidence_type, metric, unit, time_scope, query) -> dict:
+    """One fixed query, one row per job and instance (largest first)."""
+
+    data, error = run_query(query)
+
+    if error:
+        return err(evidence_type, error)
+
+    rows = []
+
+    for item in data.get("result", []):
+        try:
+            value = float(item["value"][1])
+        except (KeyError, TypeError, ValueError, IndexError):
+            continue
+
+        if not math.isfinite(value):
+            continue
+
+        labels = item.get("metric", {})
+        rows.append(
+            {
+                "job": labels.get("job", ""),
+                "instance": labels.get("instance", ""),
+                "value": value,
+            }
+        )
+
+    if not rows:
+        return err(
+            evidence_type,
+            "Prometheus returned no data for this measurement "
+            "(metric missing or targets not scraped).",
+        )
+
+    rows.sort(key=lambda row: row["value"], reverse=True)
+
+    return ok(
+        evidence_type,
+        metric=metric,
+        unit=unit,
+        time_scope=time_scope,
+        series_count=len(rows),
+        series=rows[:MAX_SERIES],
     )
 
 
 @mcp.tool(
     description=(
-        "Read the current Aegis backend CPU usage from Prometheus. "
-        "Use this to determine whether CPU usage is currently elevated. "
-        "This provides current telemetry only and does not explain the cause."
+        "Show every Prometheus scrape target: job, instance, health (up/down) "
+        "and last scrape error. Use early when a service is reported down or "
+        "unreachable: it shows which targets are down and often why the scrape "
+        "failed (connection refused, host not found). It does not show what "
+        "happened inside the service."
+    )
+)
+def query_targets() -> dict:
+    data, error = get_json("/api/v1/targets", {"state": "active"})
+
+    if error:
+        return err("scrape_targets", error)
+
+    targets = []
+
+    for target in data.get("activeTargets", []):
+        labels = target.get("labels", {})
+        targets.append(
+            {
+                "job": labels.get("job", ""),
+                "instance": labels.get("instance", ""),
+                "health": target.get("health", "unknown"),
+                "last_error": sanitize_line(target.get("lastError") or "") or None,
+                "last_scrape": target.get("lastScrape"),
+            }
+        )
+
+    if not targets:
+        return err("scrape_targets", "Prometheus has no active scrape targets.")
+
+    targets.sort(key=lambda t: (t["health"] == "up", t["job"]))   # down first
+    down = [t for t in targets if t["health"] != "up"]
+
+    if down:
+        finding = f"{len(down)} of {len(targets)} scrape targets are not up: " + "; ".join(
+            f"{t['job']} ({t['instance']}): {t['last_error'] or t['health']}"
+            for t in down[:5]
+        )
+    else:
+        finding = f"All {len(targets)} scrape targets are up."
+
+    return ok(
+        "scrape_targets",
+        time_scope="current",
+        total_count=len(targets),
+        down_count=len(down),
+        targets=targets[:MAX_TARGETS],
+        finding=finding,
+    )
+
+
+@mcp.tool(
+    description=(
+        "Current CPU usage percent of the monitored application. Use to check "
+        "whether CPU is elevated right now. Shows the value only, not the "
+        "cause. Returns an error when the application is down."
     )
 )
 def query_cpu() -> dict:
-    """Return the current CPU usage percentage of the Aegis backend."""
-
     return instant_metric(
         evidence_type="cpu_current",
         metric="cpu_usage",
         unit="percent",
         time_scope="current",
         query="aegis_cpu_usage_percent",
-        threshold={
-            "value": 70.0,
-            "unit": "percent",
-            "comparison": "greater_than",
-        },
+        threshold={"value": 70.0, "unit": "percent", "comparison": "greater_than"},
     )
 
 
 @mcp.tool(
     description=(
-        "Read the Aegis backend CPU average over the previous five minutes. "
-        "Use this to determine whether elevated CPU persisted over time. "
-        "This is historical telemetry and does not describe the current instant."
+        "CPU usage of the monitored application averaged over the last 5 "
+        "minutes. Use to check whether high CPU persisted over time. "
+        "Historical, not the current instant."
     )
 )
 def query_cpu_history() -> dict:
-    """Return the five-minute average CPU usage percentage."""
-
     return instant_metric(
         evidence_type="cpu_history",
         metric="cpu_usage",
@@ -167,81 +221,47 @@ def query_cpu_history() -> dict:
 
 @mcp.tool(
     description=(
-        "Read the current resident memory used by the Aegis backend process. "
-        "Use this when investigating memory pressure or determining whether "
-        "the application process is consuming unusually large amounts of memory. "
-        "This is read-only telemetry."
+        "Current resident memory of every scraped process, one row per job "
+        "and instance, in bytes. Use to check memory pressure or after an "
+        "out-of-memory kill; read the row for the failing service."
     )
 )
 def query_memory() -> dict:
-    """Return current resident memory used by the backend process."""
-
-    return instant_metric(
+    return series_metric(
         evidence_type="memory_current",
         metric="resident_memory",
         unit="bytes",
         time_scope="current",
-        query=f"process_resident_memory_bytes{JOB}",
+        query="process_resident_memory_bytes",
     )
 
 
 @mcp.tool(
     description=(
-        "Read how much the Aegis backend resident memory changed over the "
-        "previous 15 minutes (positive means it grew). "
-        "Use this to tell a memory leak or sustained growth from a stable level. "
-        "This is historical telemetry and does not describe the current instant."
+        "Change in resident memory over the last 15 minutes for every scraped "
+        "process, one row per job and instance (positive means growth). Use to "
+        "tell a memory leak or sustained growth from a stable level. "
+        "Historical, not the current instant."
     )
 )
 def query_memory_history() -> dict:
-    """NEW: memory trend. CPU had a history tool; memory had none.
-    Use it when memory growth or an out-of-memory kill is suspected.
-    """
-
-    return instant_metric(
+    return series_metric(
         evidence_type="memory_history",
         metric="resident_memory_change",
         unit="bytes",
         time_scope="15m_change",
-        query=f"delta(process_resident_memory_bytes{JOB}[15m])",
+        query="delta(process_resident_memory_bytes[15m])",
     )
 
 
 @mcp.tool(
     description=(
-        "Check whether Prometheus can currently scrape the Aegis backend "
-        "(1 = reachable, 0 = down). Use this to tell a stopped or unreachable "
-        "service apart from a service that simply has no data. "
-        "This is read-only telemetry."
-    )
-)
-def query_service_up() -> dict:
-    """NEW: distinguishes 'service down' from 'no data'.
-    Use this early when an incident says a service is down or unreachable: it shows whether Prometheus can reach it right now. It does not say why.
-    """
-
-    return instant_metric(
-        evidence_type="service_up_current",
-        metric="target_up",
-        unit="boolean",
-        time_scope="current",
-        query=f"up{JOB}",
-    )
-
-
-@mcp.tool(
-    description=(
-        "Read the current HTTP request rate for the Aegis backend. "
-        "Use this when investigating traffic-related incidents or determining "
-        "whether request volume is currently elevated. "
-        "This is read-only telemetry."
+        "Current HTTP request rate of the monitored application (requests per "
+        "second). Use only for traffic-related incidents."
     )
 )
 def query_request_rate() -> dict:
-    """Return the current total HTTP request rate."""
-
-    # sum(): the counter has one series per label combination. Without it the
-    # tool would report an arbitrary single series, not the total.
+    # sum(): the counter has one series per label combination.
     return instant_metric(
         evidence_type="request_rate_current",
         metric="request_rate",
@@ -253,15 +273,12 @@ def query_request_rate() -> dict:
 
 @mcp.tool(
     description=(
-        "Read the current HTTP error rate for the Aegis backend. "
-        "Use this when investigating failed requests or determining whether "
-        "the incident is associated with HTTP errors. "
-        "This is read-only telemetry."
+        "Current HTTP error rate of the monitored application (4xx and 5xx "
+        "per second). Use for failed-request incidents, or to see whether "
+        "errors accompany another problem."
     )
 )
 def query_error_rate() -> dict:
-    """Return the current total HTTP error rate."""
-
     return instant_metric(
         evidence_type="error_rate_current",
         metric="http_error_rate",
@@ -273,15 +290,11 @@ def query_error_rate() -> dict:
 
 @mcp.tool(
     description=(
-        "Read the current average HTTP request latency for the Aegis backend. "
-        "Use this when investigating slow requests or determining whether "
-        "request latency is elevated. "
-        "This is read-only telemetry."
+        "Current average HTTP request latency of the monitored application, "
+        "in seconds. Use only for slowness or latency incidents."
     )
 )
 def query_latency() -> dict:
-    """Return the current average HTTP request duration in seconds."""
-
     return instant_metric(
         evidence_type="latency_current",
         metric="request_latency",

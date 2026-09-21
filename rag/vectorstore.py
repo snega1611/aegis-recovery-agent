@@ -22,7 +22,17 @@ def _get_vector_store():
 
 def create_vector_store(chunks):
     vector_store = _get_vector_store()
-    vector_store.add_documents(chunks)
+
+    ids = [
+        f"{chunk.metadata['source']}::{index}"
+        for index, chunk in enumerate(chunks)
+    ]
+
+    vector_store.add_documents(
+        documents=chunks,
+        ids=ids,
+    )
+
     return vector_store
 
 

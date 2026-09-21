@@ -11,7 +11,8 @@ IMPORTANT
 
 from fastmcp import FastMCP
 
-from common import check_container
+from docker_utils import resolve_container
+from common import err
 
 
 mcp = FastMCP("Remediation")
@@ -23,10 +24,9 @@ BLOCKED_REASON = (
 
 
 def blocked(action: str, container_name: str) -> dict:
-    problem = check_container(container_name)
-
+    container_name, problem = resolve_container(container_name)
     if problem:
-        return {"status": "error", "action": action, "message": problem}
+        return err("docker_container_inspect", problem)
 
     return {
         "status": "blocked",

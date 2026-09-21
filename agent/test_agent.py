@@ -4,6 +4,7 @@ import operator
 import re
 from datetime import datetime, timezone
 from typing import Annotated, TypedDict
+import psycopg2
 
 import httpx
 from langchain_core.messages import AIMessage
@@ -34,13 +35,6 @@ class AgentState(TypedDict):
 # Prompts
 # =====================================================================
 
-INITIAL_PROMPT = """
-Investigate this incident:\n{incident_text}
-- Do not infer a metric from a log search query.
-- For each observation, use the actual fields and values returned by that tool.
-- Never attribute a value to a tool that did not return that value.
-"""
-
 SYSTEM_PROMPT = """You are Aegis, an SRE incident-investigation assistant.
 You only state facts that appear in tool results.
 Never invent data, causes, or fixes.
@@ -65,16 +59,23 @@ EVIDENCE SO FAR
 OPEN QUESTION
 {open_question}
 
+SUGGESTED TOOL
+{suggested_tool}
+
 YOUR TASK
-Call exactly ONE tool that gives NEW information about the open question.
+Call exactly ONE tool that answers the open question with NEW information.
 
 Rules:
-- Choose by reading what each tool does. Do not pick a tool because it worked before.
-- NEW means a tool not used yet, or the same tool with different arguments. Never repeat a call listed under CALLS ALREADY MADE.
-- Use specific arguments taken from the incident or the evidence (service name, alert name, error text, time range). Do not use broad words that match almost everything.
-- Do not explain, guess, or summarize. Do not state a cause.
-- If EVIDENCE SO FAR is "(none)", you must call a tool.
-- Otherwise, if no tool can give new information, reply with exactly: NO_NEW_EVIDENCE"""
+- Read the newest evidence first. Choose the tool that explains or follows up on it.
+- Use the suggested tool unless it would repeat an earlier call or its description says it does not fit the current evidence. If it is "(none)", choose yourself.
+- If a tool description says to use a different tool in the current situation, use that one.
+- If EVIDENCE SO FAR is "(none)", choose the tool that best shows whether the reported problem is happening right now.
+- Two tools that answer the same question are duplicates. Never call both.
+- NEW means a tool not used yet, or the same tool with different arguments. Never repeat a call under CALLS ALREADY MADE.
+- Confirming that a problem exists does not explain it. Once it is confirmed, choose a tool that shows why.
+- When a component is down or failing, examine the component itself (its runtime state, exit information, its own logs) before unrelated metrics or logs elsewhere.
+- Do not explain, guess, or state a cause.
+- If EVIDENCE SO FAR is not "(none)" and no tool can give new information, reply with exactly: NO_NEW_EVIDENCE"""
 
 # placeholders: {incident} {tool_catalog} {tried} {evidence}
 DECISION_PROMPT = """INCIDENT
@@ -90,23 +91,28 @@ EVIDENCE SO FAR
 {evidence}
 
 YOUR TASK
-Decide if the investigation should continue.
+Decide what to investigate next. Separate WHAT from WHY:
+- WHAT: the reported problem exists (something is down, high, slow, failing).
+- WHY: the evidence shows what caused it.
+Confirming WHAT never answers WHY.
 
-First, name the most important question about this incident that the evidence above does not answer yet. Write "none" if the evidence answers what it can.
-
-Then choose:
-- continue: a tool in TOOLS AVAILABLE could answer that question with NEW information (a tool not used yet, or the same tool with different arguments).
-- finish: the question is "none", OR no available tool can answer it, OR the only option would repeat a call already made.
+Known: WHAT the evidence shows, in one sentence.
+Cause established: "yes [n]" only if evidence item [n] directly shows WHY it happened, otherwise "no".
+Open question: the single most important SPECIFIC question still unanswered. Once WHAT is confirmed, this is WHY. Write "none" only if the cause is established, or no tool in TOOLS AVAILABLE could answer any remaining question.
+Best tool: the exact name of ONE tool from TOOLS AVAILABLE that answers the open question directly, or "none".
 
 Rules:
-- Not knowing the root cause is acceptable. Choose finish if no tool can help find it.
-- Do not count tools. Do not require every tool to be used.
-- Check each measurement's time_scope. A current value does not describe the past. A historical value does not describe now.
-- Do not assume evidence that is not listed.
+- Base the question on the newest evidence. A result showing something failed leads to asking why it failed.
+- Read each tool description, including when NOT to use it. Do not pick a tool just because it exists.
+- Do not ask what the evidence already answers, or what a tool already used (or an overlapping one) would answer again.
+- Not knowing the cause is NOT a reason for "none" while a tool could still help.
+- Check time_scope: a current value does not describe the past, and a historical value does not describe now.
 
 Answer in exactly this format and nothing else:
-Open question: <one sentence, or none>
-Decision: <continue or finish>"""
+Known: <sentence>
+Cause established: <yes [n] or no>
+Open question: <sentence, or none>
+Best tool: <tool name, or none>"""
 
 # placeholders: {incident} {tried} {evidence}
 FINAL_PROMPT = """INCIDENT
@@ -119,31 +125,25 @@ EVIDENCE
 {evidence}
 
 YOUR TASK
-Write the investigation report using ONLY the evidence above.
+Write the analysis using ONLY the evidence above. The evidence list is shown to the reader separately, so do not copy it. Refer to items by number, like [2].
 
-Use exactly these five sections:
+Use exactly these four sections:
 
 1. Incident
-One or two sentences restating the reported incident. Use the severity exactly as given.
+One or two sentences restating the reported incident, with the severity exactly as given. Add nothing else.
 
-2. Observations
-One bullet per evidence item: what was measured or found, the value and unit copied exactly, and its time_scope. Guidance or documentation results are not observations. List them under "Reference guidance" only if they help, and never treat them as findings.
+2. Root cause
+Write "Confirmed: <cause> [n]" only if an item directly states or shows that cause. Otherwise write exactly: "Root cause not confirmed." Do not list possible causes.
 
-3. Current state
-Say whether the evidence shows the condition is active now. If no evidence with a current time_scope covers it, write: "Current state not determined."
-
-4. Root cause
-Write "Confirmed: <cause>" only if an observation directly states or shows that cause. Otherwise write exactly: "Root cause not confirmed." Do not list possible causes.
-
-5. Gaps
-List information that is still missing, phrased as data to collect (not as causes). Write "None" if nothing is missing.
+- A "finding" or "note" field is the tool's own statement of what its result means. Use it as written.
 
 Rules:
-- Copy numbers exactly. Do not round, rescale, or convert them.
-- A measurement shows what a value is, not why. Do not explain why unless an observation states the reason.
+- Say what a value shows only as the tool returned it. Never attribute a value to a tool that did not return it.
+- A tool call or search query is not evidence. Only its result is.
+- A measurement shows what a value is, not why.
+- Documentation guidance is not evidence about this incident.
 - Do not say the incident is resolved unless the evidence shows it.
-- Do not add facts that are not in EVIDENCE.
-- Do not call tools."""
+- Do not add facts that are not in EVIDENCE."""
 
 
 # =====================================================================
@@ -189,20 +189,34 @@ def format_tried(used_tools: list) -> str:
     return "\n".join(f"- {sig}" for sig in used_tools) or "(none)"
 
 
+MAX_LIST_ITEMS = 6      # newest items shown per list
+MAX_ITEM_CHARS = 160
+
+def compact(result):
+    if not isinstance(result, dict):
+        return str(result)[:MAX_ITEM_CHARS]
+    parts = []
+    for key, value in result.items():
+        if key in ("evidence_type", "observed_at"):
+            continue
+        if key == "status" and value == "ok":
+            continue
+        if isinstance(value, list):
+            shown = [str(v)[:MAX_ITEM_CHARS] for v in value[-MAX_LIST_ITEMS:]]
+            earlier = len(value) - len(shown)
+            value = "[" + " | ".join(shown) + "]" + (f" (+{earlier} earlier)" if earlier else "")
+        elif isinstance(value, dict):
+            value = json.dumps(value)
+        parts.append(f"{key}={value}")
+    return ", ".join(parts)
+
 def format_evidence(evidence: list) -> str:
-    """One compact line per evidence item. Used by every prompt so the
-    evidence appears exactly once and in the same form everywhere."""
     if not evidence:
         return "(none)"
-
-    lines = []
-    for index, item in enumerate(evidence, start=1):
-        result = item["result"]
-        text = result if isinstance(result, str) else json.dumps(result, default=str)
-        if len(text) > MAX_RESULT_CHARS:
-            text = text[:MAX_RESULT_CHARS] + "...[truncated]"
-        lines.append(f"[{index}] {item['call']} -> {text}")
-    return "\n".join(lines)
+    return "\n".join(
+        f"[{i}] {item['call']} -> {compact(item['result'])}"
+        for i, item in enumerate(evidence, start=1)
+    )
 
 
 def first_line(text: str, limit: int = 150) -> str:
@@ -260,11 +274,53 @@ def normalize_tool_call(response, tools_by_name):
 
 async def main():
 
-    incident_id = "ce70afdc-69c3-4c39-95ef-3ed71c31ce2b"
+    incident_id = "INC-1003"
 
-    response = httpx.get(f"http://localhost:8000/incidents/{incident_id}")
-    response.raise_for_status()
-    incident = response.json()
+    conn = psycopg2.connect(
+        host="localhost",
+        port=5433,
+        database="aegis",
+        user="postgres",
+        password="postgres",
+    )
+
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT
+            incident_id,
+            alert_name,
+            incident_type,
+            severity,
+            service,
+            status,
+            started_at,
+            description
+        FROM incidents
+        WHERE incident_id = %s
+        """,
+        (incident_id,),
+    )
+
+    row = cursor.fetchone()
+
+    cursor.close()
+    conn.close()
+
+    if row is None:
+        raise RuntimeError(f"Incident {incident_id} not found")
+
+    incident = {
+        "incident_id": row[0],
+        "alert_name": row[1],
+        "incident_type": row[2],
+        "severity": row[3],
+        "service": row[4],
+        "status": row[5],
+        "started_at": row[6],
+        "description": row[7],
+    }
 
     print("🚨 INCIDENT RECEIVED BY AEGIS:")
     print(incident)
@@ -301,7 +357,7 @@ async def main():
     llm = ChatOllama(
         model="qwen3:1.7b",
         temperature=0,
-        num_ctx=4096,
+        num_ctx=8192,
         reasoning=False,
     )
     llm_with_tools = llm.bind_tools(tools)
@@ -321,10 +377,9 @@ async def main():
 
     async def agent_node(state: AgentState):
 
-        open_question = (
-            state.get("investigation_summary", {}).get("open_question")
-            or DEFAULT_OPEN_QUESTION
-        )
+        summary = state.get("investigation_summary", {})
+        open_question = summary.get("open_question") or DEFAULT_OPEN_QUESTION
+        suggested_tool = summary.get("suggested_tool") or "(none)"
 
         messages = build_messages(
             AGENT_PROMPT.format(
@@ -332,6 +387,7 @@ async def main():
                 tried=format_tried(state["used_tools"]),
                 evidence=format_evidence(state["evidence"]),
                 open_question=open_question,
+                suggested_tool=suggested_tool,
             )
         )
 
@@ -414,23 +470,33 @@ async def main():
         )
 
         raw = THINK_RE.sub("", response.content).strip()
+        print("DECISION RAW:", raw)
 
-        match = re.search(r"decision:\s*(continue|finish)", raw, re.IGNORECASE)
-        decision = match.group(1).lower() if match else "finish"
+        match = re.search(r"cause established:\s*yes\s*\[(\d+)\]", raw, re.IGNORECASE)
+        cause_established = bool(match) and 1 <= int(match.group(1)) <= len(state["evidence"])
 
         match = re.search(r"open question:\s*(.+)", raw, re.IGNORECASE)
         open_question = match.group(1).strip() if match else ""
 
-        # Consistency only: "nothing left to ask" cannot mean "continue".
-        if open_question.lower().strip(" .") == "none":
-            decision = "finish"
+        match = re.search(r"best tool:\s*[`'\"]?([\w.-]+)", raw, re.IGNORECASE)
+        wanted = match.group(1) if match else ""
+        suggested = next((n for n in tools_by_name if n == wanted or n.endswith("_" + wanted)), "")
 
-        print("INVESTIGATION DECISION:", decision, "| open question:", open_question)
+        nothing_left = open_question.lower().strip(" .") == "none"
+        decision = "finish" if (cause_established or nothing_left) else "continue"
+
+        print("INVESTIGATION DECISION:", decision, "| cause established:", cause_established,
+            "| open question:", open_question, "| tool:", suggested)
 
         return {
             "investigation_status": decision,
-            "investigation_summary": {"open_question": open_question},
+            "investigation_summary": {
+                "open_question": open_question or "Why did the reported problem happen?",
+                "suggested_tool": suggested,
+            },
         }
+        
+    MAX_TOOL_CALLS = 8   # safety net only, not a target
 
     def route_investigation(state: AgentState):
         if state["investigation_status"] == "continue":
@@ -453,10 +519,16 @@ async def main():
             )
         )
 
-        conclusion = THINK_RE.sub("", response.content).strip()
+        analysis = THINK_RE.sub("", response.content).strip()
+        conclusion = (
+            "OBSERVATIONS (from tool results)\n"
+            + format_evidence(state["evidence"])
+            + "\n\nANALYSIS\n"
+            + analysis
+        )
 
         print("INVESTIGATION CONCLUSION:", conclusion)
-
+        
         return {
             "messages": [AIMessage(content=conclusion)],
             "investigation_summary": {
@@ -508,7 +580,7 @@ async def main():
     initial_state = {
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": INITIAL_PROMPT},
+            {"role": "user", "content": f"Investigate this incident:\n{incident_text}"},
         ],
         "investigation_status": "continue",   # was "finish": told the first turn not to call tools
         "evidence": [],

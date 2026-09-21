@@ -59,14 +59,3 @@ def sanitize_line(line: str) -> str:
     if len(line) > MAX_LINE_CHARS:
         line = line[:MAX_LINE_CHARS] + "..."
     return line
-
-
-def check_container(name: str):
-    """Return an actionable error message if `name` is not an Aegis lab
-    container name, otherwise None."""
-    if not isinstance(name, str) or not _NAME_RE.match(name) or not name.startswith(LAB_PREFIX):
-        return (
-            f"'{name}' is not an Aegis lab container. Names must start with "
-            f"'{LAB_PREFIX}'. Call list_containers to see the valid names."
-        )
-    return None
