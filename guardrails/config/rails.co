@@ -1,0 +1,9 @@
+define subflow aegis sre policy
+
+  $result = execute aegis_sre_policy
+
+  if $result.is_blocked
+
+    bot refuse to respond
+
+    stop

@@ -4,6 +4,7 @@ import threading
 import psutil
 import logging
 import uuid
+import cre
 
 import psycopg2
 from fastapi import FastAPI, Request, HTTPException
@@ -133,7 +134,7 @@ def get_orders():
     connection = get_db_connection()
 
     cursor = connection.cursor()
-    cursor.execute("SELECT id, status, total_amount FROM orders ORDER BY id")
+    cursor.execute("SELECT id, status FROM orders ORDER BY id")
 
     orders = [
         {"id": row[0], "status": row[1]}

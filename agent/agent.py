@@ -18,6 +18,7 @@ from langgraph.types import Command
 
 from agent.mcp_client import create_mcp_adapter
 from rag.vectorstore import load_vector_store
+from guardrails.config.actions import aegis_sre_policy
 
 
 class AgentState(TypedDict):
@@ -424,7 +425,7 @@ def normalize_tool_call(response, tools_by_name):
 
 async def main():
 
-    incident_id = sys.argv[1] if len(sys.argv) > 1 else "INC-1008"
+    incident_id = sys.argv[1] if len(sys.argv) > 1 else "INC-1009"
 
     conn = psycopg2.connect(host="127.0.0.1", port=5433, database="aegis_incidents", user="postgres", password="postgres")
     cursor = conn.cursor()
@@ -676,6 +677,8 @@ async def main():
             "investigation_summary": {
                 "open_question": open_question or "Why did the reported problem happen?",
                 "guidance": guidance,
+                "cause_established": cause_established,
+                "root_cause_evidence": cited_idx,
             },
         }
 
@@ -683,8 +686,61 @@ async def main():
         if state["investigation_status"] == "continue" and len(state["used_tools"]) < MAX_TOOL_CALLS:
             return "agent"
         return "final_answer"
+    
+    def evaluate_aegis_policy(state: AgentState) -> dict:
+        summary = state.get("investigation_summary", {})
+
+        cause_established = summary.get("cause_established", False)
+
+        root_cause_evidence_is_direct = False
+
+        cited_idx = summary.get("root_cause_evidence")
+
+        if (
+            cause_established
+            and isinstance(cited_idx, int)
+            and 1 <= cited_idx <= len(state["evidence"])
+        ):
+            cited_item = state["evidence"][cited_idx - 1]
+            root_cause_evidence_is_direct = (
+                cited_item.get("category") == "direct"
+            )
+
+        recommendation_supported = (
+            cause_established
+            and root_cause_evidence_is_direct
+        )
+
+        return {
+            "cause_established": cause_established,
+            "root_cause_evidence_is_direct": root_cause_evidence_is_direct,
+            "recommendation_supported": recommendation_supported,
+        }
+    
 
     async def final_answer(state: AgentState):
+
+        policy = evaluate_aegis_policy(state)
+
+        guardrail_result = await aegis_sre_policy(policy)
+
+        print("AEGIS GUARDRAIL:", guardrail_result)
+
+        if guardrail_result.is_blocked:
+            conclusion = (
+                "INVESTIGATION BLOCKED BY AEGIS SRE POLICY\n\n"
+                f"Reason: {guardrail_result.reason}"
+            )
+
+            return {
+                "messages": [AIMessage(content=conclusion)],
+                "investigation_summary": {
+                    "status": "blocked_by_guardrail",
+                    "guardrail": guardrail_result.reason,
+                    "evidence": state["evidence"],
+                    "used_tools": state["used_tools"],
+                },
+            }
 
         response = await llm.ainvoke(
             build_messages(
@@ -714,16 +770,6 @@ async def main():
                 "conclusion": conclusion,
                 "evidence": state["evidence"],
                 "used_tools": state["used_tools"],
-            },
-        }
-
-        print("INVESTIGATION CONCLUSION:", conclusion)
-
-        return {
-            "messages": [AIMessage(content=conclusion)],
-            "investigation_summary": {
-                "status": "investigation_complete", "conclusion": conclusion,
-                "evidence": state["evidence"], "used_tools": state["used_tools"],
             },
         }
 

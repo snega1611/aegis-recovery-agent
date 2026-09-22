@@ -1,0 +1,11 @@
+id: aegis_guardrails
+
+models:
+  - type: main
+    engine: ollama
+    model: qwen3:1.7b
+
+rails:
+  output:
+    flows:
+      - aegis sre policy
