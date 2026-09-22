@@ -4,7 +4,6 @@ import threading
 import psutil
 import logging
 import uuid
-import this_module_does_not_exist
 
 import psycopg2
 from fastapi import FastAPI, Request, HTTPException
@@ -319,7 +318,7 @@ async def get_incident(incident_id: str):
         FROM incidents
         WHERE incident_id = %s
         """,
-        (incident_id,),
+        (incident_i,),
     )
 
     row = cursor.fetchone()

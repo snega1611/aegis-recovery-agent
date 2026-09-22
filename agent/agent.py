@@ -161,7 +161,7 @@ EVIDENCE
 YOUR TASK
 Write the analysis using ONLY the evidence above. The evidence list is shown to the reader separately, so do not copy it. Refer to items by number, like [2].
 
-Use exactly these four sections:
+Use exactly these six sections:
 
 1. Incident
 One or two sentences restating the reported incident, with the severity exactly as given. Add nothing else.
@@ -172,7 +172,30 @@ One sentence saying what the items whose time_scope starts with "current" show a
 3. Root cause
 Write "Confirmed: <cause> [n]" only if an item directly states or shows that cause. Otherwise write exactly: "Root cause not confirmed." Do not list possible causes.
 
-4. Gaps
+4. Recommended resolution
+If the root cause is confirmed, give the specific corrective action supported by the evidence.
+
+The recommendation must address the confirmed root cause. Do not invent commands, configuration changes, files, values, or actions that are not supported by the evidence.
+
+If the root cause is not confirmed, write exactly:
+"Resolution cannot be recommended until the root cause is confirmed."
+
+5. Risk
+State the risk of the recommended resolution as exactly one of:
+LOW
+MEDIUM
+HIGH
+NOT ASSESSED
+
+Use:
+- LOW for read-only or non-impacting actions.
+- MEDIUM for reversible changes that may temporarily affect a component.
+- HIGH for actions that restart, stop, modify, redeploy, or otherwise affect a running service.
+- NOT ASSESSED when a resolution cannot be recommended.
+
+Add one short sentence explaining the risk based on the recommended action.
+
+6. Gaps
 What is still unknown, as data to collect (not causes). If the root cause is not confirmed, say what evidence would establish it. Never write "None" in that case.
 
 Rules:
@@ -184,7 +207,10 @@ Rules:
 - Do not add facts that are not in EVIDENCE.
 - An evidence item marked invalid is a tool-call failure, not incident data. You may note
   that the tool call failed; never use it to support Current state or Root cause.
-  """
+- A failure mechanism is not automatically the root cause.
+- The recommended resolution must be supported by the confirmed root cause and evidence.
+- Do not claim that a recommended action has already been executed.
+"""
 
 
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
@@ -243,11 +269,47 @@ TOOL_CATEGORY = {
     "operations_get_commit": "context",
     "operations_get_commit_files": "context",
 }
+def is_informative(result) -> bool:
+    """Generic check: did this tool actually find data, or come back empty? Looks at
+    common 'how many did we find' fields — no incident-specific content."""
+    if not isinstance(result, dict):
+        return True
+    for key in ("match_count", "returned_count", "count", "line_count", "total_count", "down_count"):
+        if key in result and result[key] == 0:
+            return False
+    for key in ("matches", "lines", "commits", "targets"):
+        if key in result and isinstance(result[key], list) and len(result[key]) == 0:
+            return False
+    return True
 
 def evidence_category(tool_name: str, result) -> str:
     if isinstance(result, dict) and result.get("status") == "error":
         return "invalid"  # a tool-call failure, not evidence about the incident
+    if not is_informative(result):
+        return "inconclusive"  # ran fine, found nothing — doesn't establish anything
     return TOOL_CATEGORY.get(tool_name, "symptom")
+
+def commit_predates_incident(commit_date_str: str, started_at) -> bool:
+    """True if a commit's date is on or before the incident's started_at. Unparsable
+    dates are allowed through — the app doesn't invent judgments the data can't support."""
+    try:
+        commit_dt = datetime.fromisoformat(commit_date_str)
+    except Exception:
+        return True
+    if commit_dt.tzinfo is None:
+        commit_dt = commit_dt.replace(tzinfo=timezone.utc)
+    started = started_at if started_at.tzinfo else started_at.replace(tzinfo=timezone.utc)
+    return commit_dt <= started
+
+
+def find_commit_date(evidence: list, commit_hash: str):
+    for item in evidence:
+        result = item.get("result")
+        if isinstance(result, dict) and result.get("evidence_type") == "git_recent_commits":
+            for c in result.get("commits", []):
+                if c.get("commit") == commit_hash:
+                    return c.get("date")
+    return None
 
 def compact(result):
     if not isinstance(result, dict):
@@ -290,13 +352,23 @@ def allowed_arg_names(tool):
     return None
 
 
-def available_tools(tools, used_tools):
-    """Hide zero-argument tools that were already called: repeating them can never add evidence."""
-    return [
+GIT_TOOLS = {"operations_get_recent_commits", "operations_get_commit", "operations_get_commit_files"}
+
+def available_tools(tools, used_tools, evidence=None):
+    """Hide zero-argument tools that were already called: repeating them can never add
+    evidence. Also hide git/history tools until at least one informative 'direct' item
+    (the component's own state/logs) has been collected — history should explain a
+    confirmed failure mechanism, not substitute for finding one."""
+    evidence = evidence or []
+    has_direct_evidence = any(e.get("category") == "direct" for e in evidence)
+
+    usable = [
         t for t in tools
         if not (allowed_arg_names(t) == set() and call_signature(t.name, {}) in used_tools)
     ]
-
+    if not has_direct_evidence:
+        usable = [t for t in usable if t.name not in GIT_TOOLS]
+    return usable
 
 def format_catalog(tools) -> str:
     return "\n".join(f"- {t.name}: {first_line(t.description)}" for t in tools)
@@ -351,9 +423,9 @@ def normalize_tool_call(response, tools_by_name):
 
 async def main():
 
-    incident_id = sys.argv[1] if len(sys.argv) > 1 else "INC-1003"
+    incident_id = sys.argv[1] if len(sys.argv) > 1 else "INC-1004"
 
-    conn = psycopg2.connect(host="localhost", port=5433, database="aegis", user="postgres", password="postgres")
+    conn = psycopg2.connect(host="127.0.0.1", port=5433, database="aegis", user="postgres", password="postgres")
     cursor = conn.cursor()
     cursor.execute(
         """
@@ -421,7 +493,7 @@ async def main():
         open_question = summary.get("open_question") or DEFAULT_OPEN_QUESTION
         guidance = summary.get("guidance") or await retrieve_guidance(vector_store, incident_query)
 
-        usable = available_tools(tools, state["used_tools"])
+        usable = available_tools(tools, state["used_tools"], state["evidence"])
         if not usable:
             return {"messages": [AIMessage(content="NO_NEW_EVIDENCE")]}
 
@@ -448,7 +520,15 @@ async def main():
                 return False
             call = resp.tool_calls[0]
             tool = tools_by_name.get(call["name"])
-            return tool is not None and not validate_tool_args(tool, call["args"])
+            if tool is None:
+                return False
+            if not validate_tool_args(tool, call["args"]):
+                return True
+            if call["name"] in ("operations_get_commit", "operations_get_commit_files"):
+                commit_date = find_commit_date(state["evidence"], call["args"].get("commit", ""))
+                if commit_date and not commit_predates_incident(commit_date, incident["started_at"]):
+                    return True  # post-incident commit — can't be the cause, reject and retry
+            return False
 
         # Exact repeat of an earlier call, OR args that don't satisfy the tool's own
         # schema: retry ONCE with that tool removed (temp=0 means retrying with the
@@ -534,7 +614,9 @@ async def main():
             build_messages(
                 DECISION_PROMPT.format(
                     incident=incident_text,
-                    tool_catalog=format_catalog(available_tools(tools, state["used_tools"])),
+                    tool_catalog=format_catalog(
+                        available_tools(tools, state["used_tools"], state["evidence"])
+                    ),
                     tried=format_tried(state["used_tools"]),
                     evidence=format_evidence(state["evidence"]),
                     newest_evidence=newest_evidence,
@@ -613,7 +695,25 @@ async def main():
         )
 
         analysis = THINK_RE.sub("", response.content).strip()
-        conclusion = "OBSERVATIONS (from tool results)\n" + format_evidence(state["evidence"]) + "\n\nANALYSIS\n" + analysis
+
+        conclusion = (
+            "OBSERVATIONS (from tool results)\n"
+            + format_evidence(state["evidence"])
+            + "\n\nANALYSIS\n"
+            + analysis
+        )
+
+        print("INVESTIGATION CONCLUSION:", conclusion)
+
+        return {
+            "messages": [AIMessage(content=conclusion)],
+            "investigation_summary": {
+                "status": "investigation_complete",
+                "conclusion": conclusion,
+                "evidence": state["evidence"],
+                "used_tools": state["used_tools"],
+            },
+        }
 
         print("INVESTIGATION CONCLUSION:", conclusion)
 
