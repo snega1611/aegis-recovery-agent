@@ -122,7 +122,7 @@ def health():
 def readiness():
     try:
         connection = get_db_connection()
-        connection.close()
+        connectio.close()
         return {"status": "ready", "database": "connected"}
     except Exception:
         return {"status": "not_ready", "database": "unavailable"}
@@ -318,7 +318,7 @@ async def get_incident(incident_id: str):
         FROM incidents
         WHERE incident_id = %s
         """,
-        (incident_i,),
+        (incident_id,),
     )
 
     row = cursor.fetchone()
