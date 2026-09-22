@@ -268,6 +268,7 @@ TOOL_CATEGORY = {
     "operations_get_recent_commits": "context",
     "operations_get_commit": "context",
     "operations_get_commit_files": "context",
+    "operations_get_commit_diff": "direct",
 }
 def is_informative(result) -> bool:
     """Generic check: did this tool actually find data, or come back empty? Looks at
@@ -423,9 +424,9 @@ def normalize_tool_call(response, tools_by_name):
 
 async def main():
 
-    incident_id = sys.argv[1] if len(sys.argv) > 1 else "INC-1004"
+    incident_id = sys.argv[1] if len(sys.argv) > 1 else "INC-1008"
 
-    conn = psycopg2.connect(host="127.0.0.1", port=5433, database="aegis", user="postgres", password="postgres")
+    conn = psycopg2.connect(host="127.0.0.1", port=5433, database="aegis_incidents", user="postgres", password="postgres")
     cursor = conn.cursor()
     cursor.execute(
         """
@@ -510,10 +511,11 @@ async def main():
         response = await llm.bind_tools(usable).ainvoke(messages)
         response, signature = normalize_tool_call(response, tools_by_name)
 
-        # The model sometimes returns nothing at all (no tool call, no text): retry once.
+        # If the retry above still produced nothing usable, stop guessing why and
+        # make the outcome explicit. This is the ONLY place an empty response can
+        # originate from now — it can never reach the graph as ambiguous content.
         if not response.tool_calls and not (response.content or "").strip():
-            response = await llm.bind_tools(usable).ainvoke(messages)
-            response, signature = normalize_tool_call(response, tools_by_name)
+            response = AIMessage(content="NO_NEW_EVIDENCE")
 
         def _bad_call(resp):
             if not resp.tool_calls:
@@ -731,7 +733,16 @@ async def main():
     graph_builder.add_node("investigation_decision", investigation_decision)
     graph_builder.add_node("final_answer", final_answer)
     graph_builder.add_edge(START, "agent")
-    graph_builder.add_conditional_edges("agent", tools_condition, {"tools": "tools", END: "final_answer"})
+    
+    def route_agent(state: AgentState):
+        last = state["messages"][-1]
+        if getattr(last, "tool_calls", None):
+            return "tools"
+        return "final_answer"   # NO_NEW_EVIDENCE, by construction (see agent_node fix)
+
+    graph_builder.add_conditional_edges("agent", route_agent, {"tools": "tools", "final_answer": "final_answer"})
+    
+
     graph_builder.add_edge("tools", "investigation_decision")
     graph_builder.add_conditional_edges("investigation_decision", route_investigation, {"agent": "agent", "final_answer": "final_answer"})
     graph_builder.add_edge("final_answer", END)

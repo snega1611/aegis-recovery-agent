@@ -454,6 +454,60 @@ def get_commit_files(commit: str) -> dict:
         summary=summary,
     )
 
+@mcp.tool(
+    description=(
+        "Read the actual code patch introduced by one Git commit. "
+        "FIRST call get_recent_commits and select a relevant commit from "
+        "its returned list. Pass the exact 'commit' hash returned by "
+        "get_recent_commits. Do not pass a service name, container name, "
+        "commit message, or invented identifier. Use this after "
+        "get_commit_files confirms that the commit touched the relevant "
+        "component. The returned diff shows the actual lines added and "
+        "removed by the commit and can be used to identify a code or "
+        "configuration change that explains an incident. "
+        "Only commits made before the incident started can be considered "
+        "as possible causes."
+    )
+)
+def get_commit_diff(commit: str) -> dict:
+    if not isinstance(commit, str) or not COMMIT_RE.fullmatch(commit):
+        return err(
+            "git_commit_diff",
+            (
+                "Invalid commit identifier. Use the exact 7-40 character "
+                "hexadecimal commit hash returned by get_recent_commits."
+            ),
+            commit=commit,
+            category="invalid",
+        )
+
+    code, stdout, stderr = git(
+        "show",
+        "--format=",
+        "--no-color",
+        "--no-ext-diff",
+        commit,
+        "--",
+    )
+
+    if code != 0:
+        return err(
+            "git_commit_diff",
+            stderr.strip() or "Git diff lookup failed.",
+            commit=commit,
+        )
+
+    MAX_DIFF_CHARS = 12000
+    diff = stdout[:MAX_DIFF_CHARS]
+
+    truncated = len(stdout) > MAX_DIFF_CHARS
+
+    return ok(
+        "git_commit_diff",
+        commit=commit,
+        diff=diff,
+        truncated=truncated,
+    )
 
 if __name__ == "__main__":
     mcp.run()

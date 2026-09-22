@@ -28,6 +28,9 @@ services:
       DB_NAME: aegis
       DB_USER: postgres
       DB_PASSWORD: postgres
+      INCIDENT_DB_HOST: postgres
+      INCIDENT_DB_PORT: 5432
+      INCIDENT_DB_NAME: aegis_incidents
     ports:
       - "8000:8000"
     volumes:

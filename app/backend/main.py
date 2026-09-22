@@ -122,7 +122,7 @@ def health():
 def readiness():
     try:
         connection = get_db_connection()
-        connectio.close()
+        connection.close()
         return {"status": "ready", "database": "connected"}
     except Exception:
         return {"status": "not_ready", "database": "unavailable"}
@@ -133,7 +133,7 @@ def get_orders():
     connection = get_db_connection()
 
     cursor = connection.cursor()
-    cursor.execute("SELECT id, status FROM orders ORDER BY id")
+    cursor.execute("SELECT id, status, total_amount FROM orders ORDER BY id")
 
     orders = [
         {"id": row[0], "status": row[1]}
@@ -194,8 +194,18 @@ async def receive_alert(request: Request):
     print("🚨 ALERT PAYLOAD:")
     print(alert)
     fingerprint = alert["fingerprint"]
+    
+    def get_incident_db_connection():
+        return psycopg2.connect(
+            host=os.getenv("INCIDENT_DB_HOST", "127.0.0.1"),
+            port=os.getenv("INCIDENT_DB_PORT", "5433"),
+            database=os.getenv("INCIDENT_DB_NAME", "aegis_incidents"),
+            user=os.getenv("DB_USER", "postgres"),
+            password=os.getenv("DB_PASSWORD", "postgres"),
+            connect_timeout=5,
+        )
 
-    conn = get_db_connection()
+    conn = get_incident_db_connection()
     cursor = conn.cursor()
 
     if alert["status"] == "firing":
