@@ -18,6 +18,7 @@ from langgraph.types import Command
 
 from agent.mcp_client import create_mcp_adapter
 from rag.vectorstore import load_vector_store
+from guardrails.config.actions import aegis_sre_policy
 
 
 class AgentState(TypedDict):
@@ -77,9 +78,23 @@ Rules:
   - A commit can only be considered a possible cause if its commit date is before the incident started_at time.
   - Ignore commits made after the incident started_at time when investigating the cause. Do not call get_commit or get_commit_files for a post-incident commit.
   
-- Confirming that a problem exists does not explain it. Once it is confirmed, choose a tool that shows why.
-- When a component is down or failing, examine the component itself (its runtime state, exit information, its own logs) before unrelated metrics or logs elsewhere.
-- Do not explain, guess, or state a cause.
+- Confirming that a problem exists does not explain it. Once the problem is confirmed,
+  choose a tool that provides the next level of evidence.
+
+- When a component is down or failing, examine the component itself (its runtime state,
+  exit information, or its own logs) before unrelated metrics or logs elsewhere.
+
+- If direct evidence establishes a failure mechanism but the ROOT CAUSE is not established,
+  investigate what introduced or explains that mechanism.
+
+- When the open question asks why a failure mechanism exists or was introduced, prefer
+  an available historical/context tool that can answer that question. For code or
+  configuration failures, this may require checking relevant historical changes.
+
+- Follow the Git rules below exactly when using Git tools.
+
+- Do not state a cause in your response. Use tools to obtain evidence for the cause.
+
 - If EVIDENCE SO FAR is not "(none)" and no tool can give new information, reply with exactly: NO_NEW_EVIDENCE
 - Never invent an identifier (a commit hash, container ID, file path). Only use one that
   appears verbatim in the incident text or in an earlier evidence item.
@@ -133,11 +148,14 @@ Reasoning rules:
   NOT evidence about the incident, only proof a tool call did not succeed).
 - Never cite an "invalid" item as Known or as Cause established. If the newest evidence
   is invalid, pick a different tool next.
-- Once a "direct" item shows the mechanism behind the reported problem (an exception, a
-  crash, a non-running state, resource exhaustion, etc.), that satisfies WHY for this
-  investigation. Do not keep asking what caused THAT (e.g. which commit or config caused
-  it) — that is a remediation-phase question, not part of confirming why the component
-  is currently failing.
+- A direct item can establish the FAILURE MECHANISM without establishing the ROOT CAUSE.
+- If direct evidence establishes a failure mechanism but does not establish why that
+  mechanism exists or was introduced, Cause established must be "no".
+- In that situation, the open question must ask what evidence would establish why the
+  failure mechanism exists or was introduced.
+- Historical/context evidence such as a relevant Git change may establish the root cause
+  when it directly connects the change to the failure mechanism and occurred before the
+  incident started_at time.
 
 Answer exactly:
 
@@ -312,10 +330,13 @@ def find_commit_date(evidence: list, commit_hash: str):
                     return c.get("date")
     return None
 
-def compact(result):
-    if not isinstance(result, dict):
-        return str(result)[:MAX_ITEM_CHARS]
-    parts = []
+def compact(result, started_at=None): 
+    if not isinstance(result, dict): 
+        return str(result)[:MAX_ITEM_CHARS] 
+    if started_at and result.get("evidence_type") == "git_recent_commits": 
+        kept = [c for c in result.get("commits", []) if commit_predates_incident(c.get("date", ""), started_at)] 
+        result = {**result, "count": len(kept), "commits": kept} 
+    parts = [] 
     for key, value in result.items():
         if key in ("evidence_type", "observed_at"):
             continue
@@ -329,14 +350,6 @@ def compact(result):
             value = json.dumps(value)
         parts.append(f"{key}={value}")
     return ", ".join(parts)
-
-def format_evidence(evidence: list) -> str:
-    if not evidence:
-        return "(none)"
-    return "\n".join(
-        f"[{i}] ({item.get('category', 'symptom')}) {item['call']} -> {compact(item['result'])}"
-        for i, item in enumerate(evidence, start=1)
-    )
 
 
 def first_line(text: str, limit: int = 320) -> str:
@@ -353,7 +366,7 @@ def allowed_arg_names(tool):
     return None
 
 
-GIT_TOOLS = {"operations_get_recent_commits", "operations_get_commit", "operations_get_commit_files"}
+GIT_TOOLS = { "operations_get_recent_commits", "operations_get_commit", "operations_get_commit_files", "operations_get_commit_diff", }
 
 def available_tools(tools, used_tools, evidence=None):
     """Hide zero-argument tools that were already called: repeating them can never add
@@ -422,9 +435,14 @@ def normalize_tool_call(response, tools_by_name):
     return response, call_signature(call["name"], call["args"])
 
 
-async def main():
-
-    incident_id = sys.argv[1] if len(sys.argv) > 1 else "INC-1009"
+async def run_investigation(incident_id: str, on_event=None):
+    
+    def emit_event(event_type: str, **data):
+        if on_event:
+            on_event({
+                "type": event_type,
+                **data,
+            })
 
     conn = psycopg2.connect(host="127.0.0.1", port=5433, database="aegis_incidents", user="postgres", password="postgres")
     cursor = conn.cursor()
@@ -455,6 +473,14 @@ async def main():
         "incident_id": row[0], "alert_name": row[1], "incident_type": row[2], "severity": row[3],
         "service": row[4], "status": row[5], "started_at": row[6], "description": row[7],
     }
+    
+    emit_event(
+        "incident_received",
+        incident_id=incident["incident_id"],
+        description=incident["description"],
+        severity=incident["severity"],
+        status=incident["status"],
+    )
 
     print("INCIDENT RECEIVED BY AEGIS:")
     print(incident)
@@ -485,7 +511,7 @@ async def main():
         ]
 
     def guidance_query(state: AgentState) -> str:
-        latest = compact(state["evidence"][-1]["result"]) if state["evidence"] else ""
+        latest = compact(state["evidence"][-1]["result"], started_at=incident["started_at"]) if state["evidence"] else ""
         return f"{incident_query[:250]} | {latest[:250]}"
 
     async def agent_node(state: AgentState):
@@ -511,11 +537,39 @@ async def main():
         response = await llm.bind_tools(usable).ainvoke(messages)
         response, signature = normalize_tool_call(response, tools_by_name)
 
-        # If the retry above still produced nothing usable, stop guessing why and
-        # make the outcome explicit. This is the ONLY place an empty response can
-        # originate from now — it can never reach the graph as ambiguous content.
-        if not response.tool_calls and not (response.content or "").strip():
-            response = AIMessage(content="NO_NEW_EVIDENCE")
+        if not response.tool_calls:
+            retry_prompt = AGENT_PROMPT.format(
+                incident=incident_text,
+                tried=format_tried(state["used_tools"]),
+                evidence=format_evidence(state["evidence"]),
+                open_question=open_question,
+                guidance=guidance,
+            ) + """
+
+        IMPORTANT:
+        The investigation is still in progress.
+
+        Do not return NO_NEW_EVIDENCE if an unused available tool can answer
+        the OPEN QUESTION.
+
+        Choose exactly ONE available tool that provides NEW information.
+        """
+
+            retry = await llm.bind_tools(usable).ainvoke(
+                build_messages(retry_prompt)
+            )
+
+            retry, retry_signature = normalize_tool_call(
+                retry,
+                tools_by_name,
+            )
+
+            if retry.tool_calls:
+                response = retry
+                signature = retry_signature
+            else:
+                response = AIMessage(content="NO_NEW_EVIDENCE")
+                signature = None
 
         def _bad_call(resp):
             if not resp.tool_calls:
@@ -526,10 +580,10 @@ async def main():
                 return False
             if not validate_tool_args(tool, call["args"]):
                 return True
-            if call["name"] in ("operations_get_commit", "operations_get_commit_files"):
-                commit_date = find_commit_date(state["evidence"], call["args"].get("commit", ""))
-                if commit_date and not commit_predates_incident(commit_date, incident["started_at"]):
-                    return True  # post-incident commit — can't be the cause, reject and retry
+            if call["name"] in ( "operations_get_commit", "operations_get_commit_files", "operations_get_commit_diff", ): 
+                commit_date = find_commit_date(state["evidence"], call["args"].get("commit", "")) 
+                if commit_date and not commit_predates_incident(commit_date, incident["started_at"]): 
+                    return True # post-incident commit — can't be the cause, reject and retry
             return False
 
         # Exact repeat of an earlier call, OR args that don't satisfy the tool's own
@@ -555,7 +609,17 @@ async def main():
         args = request.tool_call.get("args", {})
         print("TOOL CALL:", request.tool_call)
 
+        emit_event(
+            "tool_start",
+            tool=name,
+        )
+
         result = await execute(request)
+
+        emit_event(
+            "tool_complete",
+            tool=name,
+        )
 
         artifact = getattr(result, "artifact", None)
         if isinstance(artifact, dict) and "structured_content" in artifact:
@@ -608,8 +672,10 @@ async def main():
         guidance = await retrieve_guidance(vector_store, guidance_query(state))
         
         newest_evidence = (
-            f"[{len(state['evidence'])}] {compact(state['evidence'][-1]['result'])}"
-            if state["evidence"] else "(none)"
+            f"[{len(state['evidence'])}] "
+            f"{compact(state['evidence'][-1]['result'], started_at=incident['started_at'])}"
+            if state["evidence"]
+            else "(none)"
         )
 
         response = await llm.ainvoke(
@@ -676,15 +742,83 @@ async def main():
             "investigation_summary": {
                 "open_question": open_question or "Why did the reported problem happen?",
                 "guidance": guidance,
+                "cause_established": cause_established,
+                "root_cause_evidence": cited_idx,
             },
         }
+        
+
+    def format_evidence(evidence):
+        if not evidence:
+            return "(none)"
+
+        return "\n".join(
+            f"[{i}] ({item.get('category', 'symptom')}) "
+            f"{item['call']} -> "
+            f"{compact(item['result'], started_at=incident['started_at'])}"
+            for i, item in enumerate(evidence, 1)
+        )
+
 
     def route_investigation(state: AgentState):
         if state["investigation_status"] == "continue" and len(state["used_tools"]) < MAX_TOOL_CALLS:
             return "agent"
         return "final_answer"
+    
+    def evaluate_aegis_policy(state: AgentState) -> dict:
+        summary = state.get("investigation_summary", {})
+
+        cause_established = summary.get("cause_established", False)
+
+        root_cause_evidence_is_direct = False
+
+        cited_idx = summary.get("root_cause_evidence")
+
+        if (
+            cause_established
+            and isinstance(cited_idx, int)
+            and 1 <= cited_idx <= len(state["evidence"])
+        ):
+            cited_item = state["evidence"][cited_idx - 1]
+            root_cause_evidence_is_direct = (
+                cited_item.get("category") == "direct"
+            )
+
+        recommendation_supported = (
+            cause_established
+            and root_cause_evidence_is_direct
+        )
+
+        return {
+            "cause_established": cause_established,
+            "root_cause_evidence_is_direct": root_cause_evidence_is_direct,
+            "recommendation_supported": recommendation_supported,
+        }
+    
 
     async def final_answer(state: AgentState):
+
+        policy = evaluate_aegis_policy(state)
+
+        guardrail_result = await aegis_sre_policy(policy)
+
+        print("AEGIS GUARDRAIL:", guardrail_result)
+
+        if guardrail_result.is_blocked:
+            conclusion = (
+                "INVESTIGATION BLOCKED BY AEGIS SRE POLICY\n\n"
+                f"Reason: {guardrail_result.reason}"
+            )
+
+            return {
+                "messages": [AIMessage(content=conclusion)],
+                "investigation_summary": {
+                    "status": "blocked_by_guardrail",
+                    "guardrail": guardrail_result.reason,
+                    "evidence": state["evidence"],
+                    "used_tools": state["used_tools"],
+                },
+            }
 
         response = await llm.ainvoke(
             build_messages(
@@ -714,16 +848,6 @@ async def main():
                 "conclusion": conclusion,
                 "evidence": state["evidence"],
                 "used_tools": state["used_tools"],
-            },
-        }
-
-        print("INVESTIGATION CONCLUSION:", conclusion)
-
-        return {
-            "messages": [AIMessage(content=conclusion)],
-            "investigation_summary": {
-                "status": "investigation_complete", "conclusion": conclusion,
-                "evidence": state["evidence"], "used_tools": state["used_tools"],
             },
         }
 
@@ -774,4 +898,7 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    if len(sys.argv) != 2:
+        raise SystemExit("Usage: python agent.py <incident_id>")
+
+    asyncio.run(run_investigation(sys.argv[1]))

@@ -59,3 +59,45 @@ def sanitize_line(line: str) -> str:
     if len(line) > MAX_LINE_CHARS:
         line = line[:MAX_LINE_CHARS] + "..."
     return line
+
+def parse_ts(value: str):
+    """Extract and parse an ISO timestamp from a log line."""
+    if not value:
+        return None
+
+    match = re.search(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z",
+        value,
+    )
+
+    if not match:
+        return None
+
+    try:
+        return datetime.fromisoformat(
+            match.group(0).replace("Z", "+00:00")
+        )
+    except ValueError:
+        return None
+
+
+def failure_lines(lines: list[str]) -> list[str]:
+    """Return log lines that contain common failure indicators."""
+    patterns = (
+        "error",
+        "exception",
+        "traceback",
+        "failed",
+        "failure",
+        "fatal",
+        "critical",
+        "panic",
+        "oom",
+        "killed",
+    )
+
+    return [
+        line
+        for line in lines
+        if any(pattern in line.lower() for pattern in patterns)
+    ]

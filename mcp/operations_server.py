@@ -3,10 +3,18 @@
 Mutating actions (restart/stop) live in remediation_server.py, which the
 investigation graph must never load.
 
-No container names are hard-coded: valid names come from Docker (see
-docker_utils.py). In Docker, point the docker CLI at a read-only
-docker-socket-proxy through DOCKER_HOST instead of mounting the socket, and
-mount the repo read-only (AEGIS_REPO_PATH).
+Docker: valid container names come from Docker itself (docker_utils.py), so
+nothing is hard-coded. In Docker, point the docker CLI at a read-only
+docker-socket-proxy through DOCKER_HOST instead of mounting the socket.
+
+Git: AEGIS_REPO_PATH is the repository to inspect, and AEGIS_APP_PATH scopes
+every git tool to the monitored application's own subdirectory inside that
+repo (e.g. "app/backend"). Without this, if Aegis's own source lives in the
+same repository as the application it monitors, every commit list and diff
+mixes Aegis's own changes in with the application's, and a commit that
+touches both can bury the one relevant file under hundreds of irrelevant
+lines. Leave AEGIS_APP_PATH empty only for a repo that IS just the
+application.
 
 NOTE: with FastMCP, `description=` REPLACES the docstring. Guidance for the
 model must be in `description=`; text added to a docstring is never seen.
@@ -18,24 +26,32 @@ import re
 
 from fastmcp import FastMCP
 
-from common import MAX_LOG_LINES, err, ok, sanitize_line
-from docker_utils import describe_containers, list_lab_containers, resolve_container, run_command
+from common import MAX_LOG_LINES, err, failure_lines, ok, parse_ts, sanitize_line
+from docker_utils import resolve_container, run_command
 
 
 mcp = FastMCP("Operations")
 
 REPO_PATH = os.path.abspath(os.getenv("AEGIS_REPO_PATH", "."))
+APP_PATH = os.getenv("AEGIS_APP_PATH", "").strip()
 
 # Only a hex hash is accepted. This also blocks argument injection such as
 # commit="--output=/some/file", which `git show` would happily obey.
 COMMIT_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
 
+MAX_DIFF_CHARS = 12000
+MAX_DIFF_FILE_CHARS = 3000   # per-file cap inside a diff, see cap_diff()
 
-def git(*args: str):
-    # -c safe.directory avoids "dubious ownership" errors for a mounted repo.
-    return run_command(
-        ["git", "-c", f"safe.directory={REPO_PATH}", "-C", REPO_PATH, *args]
-    )
+
+def git(*args: str, scoped: bool = False):
+    """Run one fixed git command. scoped=True restricts it to AEGIS_APP_PATH,
+    when set, via `-- <path>` (standard git pathspec filtering).
+    -c safe.directory avoids "dubious ownership" errors for a mounted repo.
+    """
+    cmd = ["git", "-c", f"safe.directory={REPO_PATH}", "-C", REPO_PATH, *args]
+    if scoped and APP_PATH:
+        cmd += ["--", APP_PATH]
+    return run_command(cmd)
 
 
 def percent(text):
@@ -43,6 +59,30 @@ def percent(text):
         return float(str(text).rstrip("%"))
     except ValueError:
         return None
+
+
+def cap_diff(stdout: str) -> str:
+    """Cap a multi-file diff PER FILE, not by raw total length. A single huge
+    file can then never push a small, relevant file out of the result —
+    whichever file comes first still leaves room for the next."""
+    if not stdout.strip():
+        return ""
+
+    parts = ["diff --git" + p for p in stdout.split("diff --git")[1:]]
+    if not parts:
+        return stdout[:MAX_DIFF_CHARS]
+
+    capped, budget = [], MAX_DIFF_CHARS
+    for part in parts:
+        if budget <= 0:
+            break
+        piece = part[: min(MAX_DIFF_FILE_CHARS, budget)]
+        if len(part) > len(piece):
+            piece += "\n...[file truncated]"
+        capped.append(piece)
+        budget -= len(piece)
+
+    return "\n".join(capped)
 
 
 # ----------------------------------------------------------------------
@@ -58,6 +98,8 @@ def percent(text):
     )
 )
 def list_containers() -> dict:
+    from docker_utils import list_lab_containers
+
     containers, error = list_lab_containers()
 
     if error:
@@ -123,6 +165,7 @@ def inspect_container(container_name: str) -> dict:
 
     if state.get("Running"):
         finding = f"Container {name} is running (started {state.get('StartedAt')})."
+        finished = None
     else:
         parts = [
             f"Container {name} is not running "
@@ -133,9 +176,14 @@ def inspect_container(container_name: str) -> dict:
         if docker_error:
             parts.append(f"Docker error: {docker_error}")
         finding = "; ".join(parts) + "."
+        finished_at = str(state.get("FinishedAt", ""))
+        finished = None if finished_at.startswith("0001") else parse_ts(finished_at)
 
     return ok(
         "docker_container_inspect",
+        # exit code alone says THAT it failed; an OOM kill or a Docker error says HOW.
+        kind="failure_detail" if (state.get("OOMKilled") or docker_error) else "observation",
+        event_time=finished,
         container=name,
         container_status=state.get("Status"),      # not "status": that key is the envelope
         running=state.get("Running"),
@@ -256,34 +304,25 @@ def get_container_logs(container_name: str) -> dict:
         )
 
     lines = [sanitize_line(line) for line in stdout.splitlines()[-MAX_LOG_LINES:]]
+    failures = failure_lines(lines)
 
-    timestamps = []
-    for line in lines:
-        if line:
-            timestamp = line.split(" ", 1)[0]
-            if "T" in timestamp:
-                timestamps.append(timestamp)
-
-    time_scope = f"last_{MAX_LOG_LINES}_lines"
-    if timestamps:
-        time_scope = {
-            "type": "log_range",
-            "from": timestamps[0],
-            "to": timestamps[-1],
-        }
+    if failures:
+        finding = f"The container's own log shows failure output: {failures[-1]}"
+    else:
+        finding = f"No failure output in the last {len(lines)} log lines."
 
     return ok(
         "docker_container_logs",
+        kind="failure_detail" if failures else "observation",
+        event_time=parse_ts(failures[-1] if failures else (lines[-1] if lines else "")),
         container=name,
+        finding=finding,
+        failure_lines=failures,
         line_count=len(lines),
         lines=lines,
-        time_scope=time_scope,
+        time_scope=f"last_{MAX_LOG_LINES}_lines",
     )
 
-
-# ----------------------------------------------------------------------
-# Git
-# ----------------------------------------------------------------------
 
 # ----------------------------------------------------------------------
 # Git
@@ -304,18 +343,13 @@ def get_recent_commits(limit: int = 5) -> dict:
     limit = max(1, min(limit, 20))
 
     code, stdout, stderr = git(
-        "log",
-        f"-{limit}",
-        "--abbrev=12",
-        "--date=iso-strict",
+        "log", f"-{limit}", "--abbrev=12", "--date=iso-strict",
         "--pretty=format:%h|%ad|%an|%s",
+        scoped=True,   # only commits that touched the monitored application
     )
 
     if code != 0:
-        return err(
-            "git_recent_commits",
-            stderr.strip() or "Git command failed.",
-        )
+        return err("git_recent_commits", stderr.strip() or "Git command failed.")
 
     commits = []
 
@@ -334,11 +368,7 @@ def get_recent_commits(limit: int = 5) -> dict:
             }
         )
 
-    return ok(
-        "git_recent_commits",
-        count=len(commits),
-        commits=commits,
-    )
+    return ok("git_recent_commits", count=len(commits), commits=commits)
 
 
 @mcp.tool(
@@ -360,39 +390,22 @@ def get_commit(commit: str) -> dict:
                 "hexadecimal commit hash returned by get_recent_commits."
             ),
             commit=commit,
-            category="invalid",
         )
 
     code, stdout, stderr = git(
-        "show",
-        "--no-patch",
-        "--date=iso-strict",
-        "--format=%H%n%ad%n%an%n%s%n%b",
-        commit,
-        "--",
+        "show", "--no-patch", "--date=iso-strict",
+        "--format=%H%n%ad%n%an%n%s%n%b", commit, "--",
     )
 
     if code != 0:
-        return err(
-            "git_commit",
-            stderr.strip() or "Git commit lookup failed.",
-            commit=commit,
-        )
+        return err("git_commit", stderr.strip() or "Git commit lookup failed.", commit=commit)
 
     lines = stdout.splitlines()
 
     if len(lines) < 4:
-        return err(
-            "git_commit",
-            "Git returned an unexpected result.",
-            commit=commit,
-        )
+        return err("git_commit", "Git returned an unexpected result.", commit=commit)
 
-    body = " ".join(
-        line.strip()
-        for line in lines[4:]
-        if line.strip()
-    )
+    body = " ".join(line.strip() for line in lines[4:] if line.strip())
 
     return ok(
         "git_commit",
@@ -407,12 +420,13 @@ def get_commit(commit: str) -> dict:
 
 @mcp.tool(
     description=(
-        "List the files changed by one Git commit, with line counts. "
+        "List the files changed by one Git commit, with line counts, scoped "
+        "to the monitored application. If it shows no files, the commit did "
+        "not touch the monitored application and cannot be its cause. "
         "FIRST call get_recent_commits and select a relevant commit from "
         "its returned list. Pass the exact 'commit' hash returned by "
         "get_recent_commits. Do not pass a service name, container name, "
-        "commit message, or invented identifier. Use this to determine "
-        "whether the relevant commit touched the failing component."
+        "commit message, or invented identifier."
     )
 )
 def get_commit_files(commit: str) -> dict:
@@ -424,39 +438,31 @@ def get_commit_files(commit: str) -> dict:
                 "hexadecimal commit hash returned by get_recent_commits."
             ),
             commit=commit,
-            category="invalid",
         )
 
     code, stdout, stderr = git(
-        "show",
-        "--format=",
-        "--stat=120",
-        "--no-color",
-        commit,
-        "--",
+        "show", "--format=", "--stat=120", "--no-color", commit,
+        scoped=True,
     )
 
     if code != 0:
-        return err(
-            "git_commit_files",
-            stderr.strip() or "Git lookup failed.",
-            commit=commit,
-        )
+        return err("git_commit_files", stderr.strip() or "Git lookup failed.", commit=commit)
 
-    summary = [
-        sanitize_line(line)
-        for line in stdout.splitlines()[:25]
-    ]
+    summary = [sanitize_line(line) for line in stdout.splitlines()[:25]]
 
-    return ok(
-        "git_commit_files",
-        commit=commit,
-        summary=summary,
+    finding = (
+        f"This commit did not touch {APP_PATH or 'the monitored application'}."
+        if not summary
+        else None
     )
+
+    return ok("git_commit_files", commit=commit, summary=summary, finding=finding)
+
 
 @mcp.tool(
     description=(
-        "Read the actual code patch introduced by one Git commit. "
+        "Read the actual code patch introduced by one Git commit, scoped to "
+        "the monitored application (files outside it are never shown). "
         "FIRST call get_recent_commits and select a relevant commit from "
         "its returned list. Pass the exact 'commit' hash returned by "
         "get_recent_commits. Do not pass a service name, container name, "
@@ -478,36 +484,34 @@ def get_commit_diff(commit: str) -> dict:
                 "hexadecimal commit hash returned by get_recent_commits."
             ),
             commit=commit,
-            category="invalid",
         )
 
     code, stdout, stderr = git(
-        "show",
-        "--format=",
-        "--no-color",
-        "--no-ext-diff",
-        commit,
-        "--",
+        "show", "--format=", "--no-color", "--no-ext-diff", commit,
+        scoped=True,
     )
 
     if code != 0:
-        return err(
+        return err("git_commit_diff", stderr.strip() or "Git diff lookup failed.", commit=commit)
+
+    if not stdout.strip():
+        return ok(
             "git_commit_diff",
-            stderr.strip() or "Git diff lookup failed.",
             commit=commit,
+            diff="",
+            finding=f"This commit did not touch {APP_PATH or 'the monitored application'}: not a possible cause.",
         )
 
-    MAX_DIFF_CHARS = 12000
-    diff = stdout[:MAX_DIFF_CHARS]
-
-    truncated = len(stdout) > MAX_DIFF_CHARS
+    diff = cap_diff(stdout)
 
     return ok(
         "git_commit_diff",
+        kind="failure_detail",   # the actual code change: the strongest "why" evidence available
         commit=commit,
         diff=diff,
-        truncated=truncated,
+        truncated=len(diff) < len(stdout),
     )
+
 
 if __name__ == "__main__":
     mcp.run()
