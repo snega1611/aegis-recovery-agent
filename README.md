@@ -232,7 +232,7 @@ The following screenshots show actual outputs from the project.
 
 ### 1. Available Investigation Tools
 
-![Available investigation tools](images/available-tools.png)
+![Available investigation tools](images/available_tools.png)
 
 `images/available-tools.png`
 
